@@ -1,10 +1,13 @@
-﻿using Neo.IO.Json;
+using Neo.IO.Json;
 using Neo.Ledger;
 using Neo.Network.P2P.Payloads;
 using Neo.Properties;
 using Neo.SmartContract;
+using Neo.UI.Wrappers;
 using Neo.VM;
+using Neo.Wallets;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -19,8 +22,23 @@ namespace Neo.UI
         private UInt160 script_hash;
         private ContractParameter[] parameters;
         private ContractParameter[] parameters_abi;
-
+        private List<TransactionAttributeWrapper> temp_signatures = new List<TransactionAttributeWrapper>();
         private static readonly Fixed8 net_fee = Fixed8.FromDecimal(0.001m);
+
+        class WalletEntry
+        {
+            public WalletAccount Account;
+
+            public override string ToString()
+            {
+                if (!string.IsNullOrEmpty(Account.Label))
+                {
+                    return $"[{Account.Label}] " + Account.Address;
+                }
+
+                return Account.Address;
+            }
+        }
 
         public InvokeContractDialog(InvocationTransaction tx = null)
         {
@@ -31,55 +49,36 @@ namespace Neo.UI
                 tabControl1.SelectedTab = tabPage2;
                 textBox6.Text = tx.Script.ToHexString();
             }
+            comboBoxSignature.Items.AddRange(Program.CurrentWallet.GetAccounts().Where(u => u.HasKey).Select(u => new WalletEntry() { Account = u }).ToArray());
         }
 
-        public InvocationTransaction GetTransaction()
+        public InvocationTransaction GetTransaction(Fixed8 fee, UInt160 Change_Address = null)
         {
-            Fixed8 fee = Fixed8.Zero;
             if (tx.Size > 1024)
             {
-                fee += Fixed8.FromDecimal(tx.Size * 0.00001m);
+                Fixed8 sumFee = Fixed8.FromDecimal(tx.Size * 0.00001m) + Fixed8.FromDecimal(0.001m);
+                if (fee < sumFee)
+                {
+                    fee = sumFee;
+                }
             }
-            if (Helper.CostRemind(tx.Gas.Ceiling(), fee, Fixed8.FromDecimal(0.001m)))
+
+            if (Helper.CostRemind(tx.Gas.Ceiling(), fee))
             {
-                Fixed8 sumFee = fee + Fixed8.FromDecimal(0.001m);
                 InvocationTransaction result = Program.CurrentWallet.MakeTransaction(new InvocationTransaction
                 {
                     Version = tx.Version,
                     Script = tx.Script,
                     Gas = tx.Gas,
                     Attributes = tx.Attributes,
-                    Inputs = tx.Inputs,
                     Outputs = tx.Outputs
-                }, fee: sumFee);
+                }, change_address: Change_Address, fee: fee);
                 return result;
             }
             else
             {
-                InvocationTransaction result = Program.CurrentWallet.MakeTransaction(new InvocationTransaction
-                {
-                    Version = tx.Version,
-                    Script = tx.Script,
-                    Gas = tx.Gas,
-                    Attributes = tx.Attributes,
-                    Inputs = tx.Inputs,
-                    Outputs = tx.Outputs
-                }, fee: fee);
-                return result;
+                return null;
             }
-        }
-
-        public InvocationTransaction GetTransaction(UInt160 change_address, Fixed8 fee)
-        {
-            return Program.CurrentWallet.MakeTransaction(new InvocationTransaction
-            {
-                Version = tx.Version,
-                Script = tx.Script,
-                Gas = tx.Gas,
-                Attributes = tx.Attributes,
-                Inputs = tx.Inputs,
-                Outputs = tx.Outputs
-            }, change_address: change_address, fee: fee);
         }
 
         private void UpdateParameters()
@@ -158,28 +157,64 @@ namespace Neo.UI
             if (tx == null) tx = new InvocationTransaction();
             tx.Version = 1;
             tx.Script = script;
-            if (tx.Attributes == null) tx.Attributes = new TransactionAttribute[0];
+            tx.Attributes = temp_signatures.Select(p => p.Unwrap()).ToArray();
             if (tx.Inputs == null) tx.Inputs = new CoinReference[0];
             if (tx.Outputs == null) tx.Outputs = new TransactionOutput[0];
             if (tx.Witnesses == null) tx.Witnesses = new Witness[0];
-            ApplicationEngine engine = ApplicationEngine.Run(tx.Script, tx, testMode: true);
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine($"VM State: {engine.State}");
-            sb.AppendLine($"Gas Consumed: {engine.GasConsumed}");
-            sb.AppendLine($"Evaluation Stack: {new JArray(engine.ResultStack.Select(p => p.ToParameter().ToJson()))}");
-            textBox7.Text = sb.ToString();
-            if (!engine.State.HasFlag(VMState.FAULT))
+            if (tx.Attributes != null)
             {
-                tx.Gas = engine.GasConsumed - Fixed8.FromDecimal(10);
-                if (tx.Gas < Fixed8.Zero) tx.Gas = Fixed8.Zero;
-                tx.Gas = tx.Gas.Ceiling();
-                Fixed8 fee = tx.Gas;
-                label7.Text = fee + " gas";
-                button3.Enabled = true;
+                try
+                {
+                    ContractParametersContext context;
+                    context = new ContractParametersContext(tx);
+                    Program.CurrentWallet.Sign(context);
+                    tx.Witnesses = context.GetWitnesses();
+                }
+                catch (InvalidOperationException)
+                {
+                    MessageBox.Show(Strings.UnsynchronizedBlock);
+                    return;
+                }
             }
-            else
+            else 
             {
-                MessageBox.Show(Strings.ExecutionFailed);
+                tx.Witnesses = new Witness[0];
+            }
+            using (ApplicationEngine engine = ApplicationEngine.Run(tx.Script, tx, testMode: true))
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine($"VM State: {engine.State}");
+                sb.AppendLine($"Gas Consumed: {engine.GasConsumed}");
+                sb.AppendLine($"Evaluation Stack: {new JArray(engine.ResultStack.Select(p => p.ToParameter().ToJson()))}");
+                JObject notifications = engine.Service.Notifications.Select(q =>
+                {
+                    JObject notification = new JObject();
+                    notification["contract"] = q.ScriptHash.ToString();
+                    try
+                    {
+                        notification["state"] = q.State.ToParameter().ToJson();
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        notification["state"] = "error: recursive reference";
+                    }
+                    return notification;
+                }).ToArray();
+                sb.AppendLine($"Notifications: {notifications}");
+                textBox7.Text = sb.ToString();
+                if (!engine.State.HasFlag(VMState.FAULT))
+                {
+                    tx.Gas = engine.GasConsumed - Fixed8.FromDecimal(10);
+                    if (tx.Gas < Fixed8.Zero) tx.Gas = Fixed8.Zero;
+                    tx.Gas = tx.Gas.Ceiling();
+                    Fixed8 fee = tx.Gas;
+                    label7.Text = fee + " gas";
+                    button3.Enabled = true;
+                }
+                else
+                {
+                    MessageBox.Show(Strings.ExecutionFailed);
+                }
             }
         }
 
@@ -222,6 +257,31 @@ namespace Neo.UI
             button8.Enabled = parameters_abi.Length > 0;
             UpdateParameters();
             UpdateScript();
+        }
+
+        private void Button9_Click(object sender, EventArgs e)
+        {
+            if (comboBoxSignature.SelectedItem.ToString() == "")
+            {
+                MessageBox.Show("Please choose the address");
+                return;
+            }
+            var index = comboBoxSignature.SelectedIndex;
+            temp_signatures.Add(new TransactionAttributeWrapper
+            {
+                Usage = TransactionAttributeUsage.Script,
+                Data = comboBoxSignature.SelectedItem.ToString().ToScriptHash().ToArray()
+            });
+            MessageBox.Show("Success!");
+            comboBoxSignature.Items.RemoveAt(index);
+            if (comboBoxSignature.Items.Count > 0)
+            {
+                comboBoxSignature.SelectedIndex = 0;
+            }
+            else
+            {
+                comboBoxSignature.SelectedText = "";
+            }
         }
     }
 }
